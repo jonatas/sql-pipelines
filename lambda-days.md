@@ -13,7 +13,7 @@ SELECT
 
 ### Timescaledb Toolkit
 #### &
-### Functinal Pipelines
+### Functional Pipelines
 
 #### **Jônatas Davi Paganini**
 #### @jonatasdp
@@ -32,26 +32,166 @@ SELECT
 
 # Agenda
 
-1. W** I'm doing here?
+1. Why I'm here?
 2. How aggregation functions works
 3. How Timescale implemented the Function Pipelines
 4. Examples and composition
 
-# What?
+# Why I'm here?
 
-> Why functional programming?
+* FP is really cool
+* SQL gets complicated really fast
 
-* Backend developer
-* Ruby/Shell/Postgresql/Vim
-* Postgresql since 2004.
-
-# How Aggregation works
-
-[How PostgreSQL Aggregation Works and How It Inspired Our Hyperfunctions’ Design](https://www.timescale.com/blog/how-postgresql-aggregation-works-and-how-it-inspired-our-hyperfunctions-design-2/).
+# Volatility example
 
 
-# Custom Aggregate
+```sql
+SELECT city_name, SUM(abs_delta) AS volatility
+FROM (
+  SELECT city_name,
+    ABS(
+      temp_c - LAG(temp_c) OVER (
+        PARTITION BY city_name ORDER BY time)
+    ) AS abs_delta
+  FROM weather_metrics
+) AS calc_delta
+GROUP BY city_name
+```
 
+# Volatility with pipelines
+
+```sql
+SELECT city_name,
+  ( timevector(time,temp_c::numeric)
+    ->sort()
+    ->delta()
+    ->sum()) as volatility
+FROM weather_metrics
+GROUP BY 1 ;
+```
+
+# Timevector
+
+```sql
+SELECT timevector(now(), 1);
+```
+
+# Mapping
+
+```sql
+SELECT timevector(now(), 1)->map('$value+1');
+```
+
+# Unnesting
+
+```sql
+SELECT timevector(now(), 1)
+  ->map('$value+1')
+  ->unnest();
+```
+
+# Expand `(...).*`
+
+```sql
+SELECT (
+  timevector(now(), 1)
+  ->map('$value+1')
+  ->unnest()
+).*;
+```
+
+# Inline mapping
+
+```sql
+SELECT (
+  timevector(now(), 10.0)
+  ->map('$value/3.0')
+  ->unnest()
+).*;
+```
+
+# Pre-built functions
+
+```sql
+SELECT (
+  timevector(now(), 10.0)
+  ->map('$value/3.0')
+  ->map('round($value)')
+  ->unnest()
+).*;
+```
+
+# Intervals
+
+```sql
+SELECT (
+  timevector(now(), 1)
+  ->map($$($time + '1 year'i, $value * 2)$$)
+  -> unnest()
+).*;
+```
+
+# Filtering
+
+```sql
+SELECT (
+   timevector(now(), i)
+     ->map('$value+1')
+     ->filter('$value > 2')
+     ->unnest()
+).*
+FROM generate_series(1,3) i;
+```
+
+# Customize
+
+```sql
+CREATE FUNCTION tripple(double precision)
+RETURNS double precision AS $$
+  SELECT $1 * 3;
+$$ LANGUAGE SQL;
+```
+
+Usage:
+
+```sql
+SELECT (
+  timevector(now(), 1)
+  ->map('$value+1')
+  ->map_data('tripple')
+  ->unnest()
+).*;
+```
+
+# Data types
+
+```sql
+SELECT pg_typeof(timevector(now(), 1));
+```
+
+# Functions matching PG Type
+
+```sql
+SELECT n.nspname as "Schema",
+  p.proname as "Name",
+  pg_catalog.pg_get_function_result(p.oid) as "Result data type",
+  pg_catalog.pg_get_function_arguments(p.oid) as "Argument data types",
+ CASE p.prokind
+  WHEN 'a' THEN 'agg'
+  WHEN 'w' THEN 'window'
+  WHEN 'p' THEN 'proc'
+  ELSE 'func'
+ END as "Type"
+FROM pg_catalog.pg_proc p
+     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+WHERE pg_catalog.pg_function_is_visible(p.oid)
+      AND n.nspname <> 'pg_catalog'
+      AND n.nspname <> 'information_schema'
+      AND pg_catalog.pg_get_function_arguments(p.oid) ~ 'timevector_tstz_f64'
+ORDER BY 1, 2, 4;
+```
+
+# How aggregates works?
 
 ```sql
 CREATE AGGREGATE aggregate_function_name (input_type)
@@ -70,7 +210,6 @@ CREATE FUNCTION delta_statefunc(numeric[], numeric)
     SELECT array_append($1, $2) ORDER BY 1
 $$ LANGUAGE sql;
 ```
-
 
 # Delta final
 
@@ -95,7 +234,6 @@ $$ LANGUAGE plpgsql;
 ```
 
 # Delta aggregate
-
 
 ```sql
 CREATE AGGREGATE delta(numeric) (
@@ -146,7 +284,8 @@ CREATE FUNCTION movavg_statefunc(numeric[], numeric, integer)
 $$ LANGUAGE sql;
 ```
 
-# Mov Avg Final
+# Moving Average Final function
+
 ```sql
 CREATE FUNCTION movavg_finalfunc(numeric[])
     RETURNS numeric AS $$
@@ -160,15 +299,13 @@ CREATE FUNCTION movavg_finalfunc(numeric[])
                 count := count + 1;
             END IF;
         END LOOP;
-
         IF count = 0 THEN
             RETURN NULL;
         ELSE
             RETURN sum / count;
         END IF;
     END;
-$$ LANGUAGE plpgsql;
-
+$$ LANGUAGE sql;
 ```
 
 # Mov Avg Aggregate
@@ -184,17 +321,102 @@ CREATE AGGREGATE movavg(numeric, integer) (
 # Mov Avg query
 
 ```sql
-SELECT
-    id,
-    value,
-    movavg(value, 3) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS moving_avg
-FROM
-    (SELECT generate_series(1, 10) AS id, generate_series(1, 10)::numeric AS value) AS data;
+SELECT id, value,
+  movavg(value, 3)
+    OVER (
+      ORDER BY id
+      ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) AS moving_avg
+FROM (
+  SELECT
+    generate_series(1, 10) AS id,
+    generate_series(1, 10)::numeric AS value
+) AS data;
 ```
+
+# Transition Avg
+
+<video autoplay loop muted playsinline>
+<source src="https://s3.amazonaws.com/blog.timescale.com/gifs/how-postgres-works/how_postgres_works_2.mp4" type="video/mp4">
+</video>
+
+# Final Func Avg
+
+<video autoplay loop muted playsinline>
+<source id="player" src="https://s3.amazonaws.com/blog.timescale.com/gifs/how-postgres-works/how_postgres_works_3.mp4" type="video/mp4">
+</video>
+
+# Learn More
+
+> How PostgreSQL Aggregation Works and
+> How It Inspired Our Hyperfunctions’ Design
+
+[Link to the blog post](https://www.timescale.com/blog/how-postgresql-aggregation-works-and-how-it-inspired-our-hyperfunctions-design-2/).
+
+
+                █████████████████████████████████████████████████
+                █████████████████████████████████████████████████
+                ████ ▄▄▄▄▄ █▀ █ ▄█▄▀ █ ▄ ▄▄▄█ ▀▀▄█▄▄ █ ▄▄▄▄▄ ████
+                ████ █   █ █▀▀▄███▄▄▄█▀▄▄▄ ▄▄▀▀▄▄▀█▄▀█ █   █ ████
+                ████ █▄▄▄█ █▀ ▀▄▄▀ ▄▄▀█▀▄ ▀▄█ ▀▀ █▀▄ █ █▄▄▄█ ████
+                ████▄▄▄▄▄▄▄█▄█▄▀ █ █ █▄▀ ▀▄█▄█ ▀ █▄▀ █▄▄▄▄▄▄▄████
+                ████ ▄▄ ▄█▄ ▄▀▀▄█ ▄██ █ ▀█▄▀█▄▄▄▀▄▀ ▀▄▀ ▀ █▄▀████
+                ████▄ █▀▀▄▄ ▀▀▀▀▀ ▄▄▀ ▀█▄ ▀▀█▄▀▄█▄ ▀▄▄▀ ▀▀██▀████
+                ██████ ██▄▄▀ ▄▄█▀▀▄▀▄█▀█▄▀▄ ▄▄ ▄   ▀▀█▀ ▀ ▄█ ████
+                ████  █▀▀▄▄█   █▀▄  ▄▄ █▄▀ █▄▄ ▄▀█▀█ █▀▀█▄▄▀█████
+                ████▀▄ █▀▀▄█▄  ▀▄▄ ▄▀▄▀▀▀▀ ▀▄▄█▄▀ ▀   ▀ ▀█▄▀▀████
+                ████▄ █▀▀▄▄ █  ▀▄█▀▄ █▄█ ▀ █ █▄▄ ███  █ ▀▀█▀█████
+                ██████▀▀▄█▄ ▄ ▀▄▄█▀▀▀█▄▄▀▀▄▀▄ ▄█▀▄▀▀█▀▀▀▀  ▄ ████
+                ████▄█▄█▄▀▄▀▀▄█ ▄▄██▀██ ▀▀███▄ ▄████▀▀ ▄▄ █▀█████
+                ████▀▀▄▄▄ ▄▀▀ ▄ ▄ ▄█▀ ▀ ██▄ █ ▄▄█  ▀▀█▀ ▀█▄  ████
+                ████▄  ▄▀▀▄██▄██▀ ▄ ▄ ▀█▀▀▄███▀  █ █ ▄▄ █▄▄██████
+                ████ █▄ █▄▄ █ ▀█▀▀▄▀▄█▀▄█▀█   ▄█  █ ▀█▀▀▀▄ ▀ ████
+                ████ █▀█▀ ▄ ▀█▄█▀▄▀ ▄▄█▀   ▀▀██  ▄▀█ ▀█ ▄ █▀█████
+                ████▄█▄▄▄▄▄█ ▄█▀▄▄ ▄▀▄▀ ▀█ ▀  ▄▄▀ ▀█ ▄▄▄ ▄  ▀████
+                ████ ▄▄▄▄▄ █▄█▀███▀ ▀█▄█▄  ▀█▄ ▄ █▄  █▄█ █▄ █████
+                ████ █   █ █  ▀▄▄█▀ ▀█▄▀█▀▀▀█ ▄█▀▄█▀▄▄▄▄▄▀▄█▀████
+                ████ █▄▄▄█ █ ▀▀ ▄▄▀█▀█▄▀█▀▀▀▄▄  █▄▄█  ▄▀▄██▀█████
+                ████▄▄▄▄▄▄▄█▄██▄▄▄██▄▄██▄█▄▄█▄▄▄█▄█▄█▄▄▄██▄██████
+                █████████████████████████████████████████████████
+                █████████████████████████████████████████████████
+
 
 # Toolkit
 
+We're going to explore the `toolkit_experimental` functions 😎
+
+```sql
+ALTER ROLE current_user
+in DATABASE playground
+set search_path =
+  toolkit_experimental,
+  public;
+```
+
+# Help us!
+
+We want to make it less experimental, so, if you have any feedback, please, join
+the toolkit and help us to promote experimental features with your feedback.
+
+* Toolkit is written in Rust 🦀
+* https://docs.timescale.com/api/latest/hyperfunctions/
+
+> https://github.com/timescale/timescaledb-toolkit
+
+
+# Series
+
+```sql
+CREATE VIEW series AS
+SELECT timevector(time, value)
+FROM toolkit_experimental
+  .generate_periodic_normal_series(
+    '2020-01-01 UTC'::timestamptz,
+    rng_seed => 11111);
+```
+
 # Unnest
+
 ```sql
 select unnest(timevector) from series limit 1;
 ```
@@ -202,14 +424,11 @@ select unnest(timevector) from series limit 1;
 # Unnest ().*
 
 ```sql
-select (timevector->unnest()).* from series limit 3;
+SELECT (timevector->unnest()).*
+FROM series
+LIMIT 3;
 ```
 
-# Delta
-
-```sql
-select (timevector->sort()->delta()->unnest()).* from series limit 3;
-```
 
 # Sum
 
@@ -223,10 +442,37 @@ select (timevector->sort()->delta())->sum() from series limit 3;
 select (timevector->sort()->lttb(4)->unnest()).* from series ;
 ```
 
+# Format
+
+```sql
+SELECT timevector(now(), 2);
+```
+
+Not all components are compatible with pipeline functions:
+
+```sql
+select to_text(
+  timevector(now(), 2), 
+  '{
+     x: {{ TIMES | json_encode() | safe  }},
+     y: {{ VALUES | json_encode() | safe }}
+    }::json');
+```
+
+# Combine series
+
+```sql
+select to_text(
+  timevector(now(), i),
+  '{
+     x: {{ TIMES | json_encode() | safe  }},
+     y: {{ VALUES | json_encode() | safe }}
+   }::json') from generate_series(1,3) i;
+```
+
 # Plotting
 
-
-all data:
+All data:
 
 ```sql
 with pair as (
@@ -234,7 +480,7 @@ with pair as (
   select time as x, value as y from pair ;
 ```
 
-# downsampling
+# Downsampling
 
 ```sql
 with pair as (
@@ -245,7 +491,6 @@ with pair as (
   ).* from series
 ) select time as x, value as y from pair ;
 ```
-
 
 # Extra Resources
 
